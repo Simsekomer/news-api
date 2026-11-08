@@ -1,11 +1,25 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
-const User = require("../models/User");
 const jwt = require("jsonwebtoken");
-const router = express.Router();
 const crypto = require("crypto");
+const User = require("../models/User");
 const sendMail = require("../utils/mailer");
+
+const router = express.Router();
+
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
+const RESET_CODE_MINUTES = 10;
+const MAX_RESET_ATTEMPTS = 5;
+
+function hashCode(code) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+function clearResetCode(user) {
+  user.resetPasswordCode = undefined;
+  user.resetPasswordExpires = undefined;
+  user.resetPasswordAttempts = 0;
+}
 
 // POST /api/auth/register
 router.post("/register", async (req, res) => {
@@ -72,12 +86,6 @@ router.post("/login", async (req, res) => {
   }
 });
 
-const RESET_TOKEN_MINUTES = 15;
-
-function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
 // POST /api/auth/forgot-password
 router.post("/forgot-password", async (req, res) => {
   const { email } = req.body || {};
@@ -87,7 +95,7 @@ router.post("/forgot-password", async (req, res) => {
   }
 
   // Same answer whether the email exists or not
-  const message = "If this email is registered, a reset link has been sent";
+  const message = "If this email is registered, a reset code has been sent";
 
   try {
     const user = await User.findOne({ email: email.toLowerCase().trim() });
@@ -95,26 +103,25 @@ router.post("/forgot-password", async (req, res) => {
       return res.json({ message });
     }
 
-    const resetToken = crypto.randomBytes(32).toString("hex");
+    // 6-digit code between 100000 and 999999
+    const code = crypto.randomInt(100000, 1000000).toString();
 
-    user.resetPasswordToken = hashToken(resetToken);
-    user.resetPasswordExpires = new Date(Date.now() + RESET_TOKEN_MINUTES * 60 * 1000);
+    user.resetPasswordCode = hashCode(code);
+    user.resetPasswordExpires = new Date(Date.now() + RESET_CODE_MINUTES * 60 * 1000);
+    user.resetPasswordAttempts = 0;
     await user.save();
-
-    const resetLink = `${process.env.CLIENT_URL}/reset-password/${resetToken}`;
 
     try {
       await sendMail(
         user.email,
-        "Reset your password",
-        `<p>You requested a password reset for your Maritime News account.</p>
-         <p><a href="${resetLink}">Click here to set a new password</a></p>
-         <p>This link is valid for ${RESET_TOKEN_MINUTES} minutes.
+        "Your password reset code",
+        `<p>Your Maritime News password reset code is:</p>
+         <h2 style="letter-spacing: 4px;">${code}</h2>
+         <p>This code is valid for ${RESET_CODE_MINUTES} minutes.
             If you did not request this, you can ignore this email.</p>`
       );
     } catch (mailError) {
-      user.resetPasswordToken = undefined;
-      user.resetPasswordExpires = undefined;
+      clearResetCode(user);
       await user.save();
       return res.status(500).json({ message: "Could not send reset email" });
     }
@@ -127,29 +134,39 @@ router.post("/forgot-password", async (req, res) => {
 
 // POST /api/auth/reset-password
 router.post("/reset-password", async (req, res) => {
-  const { token, password } = req.body || {};
+  const { email, code, password } = req.body || {};
 
-  if (!token || !password) {
-    return res.status(400).json({ message: "Token and new password are required" });
+  if (!email || !code || !password) {
+    return res.status(400).json({ message: "Email, code and new password are required" });
   }
 
   if (password.length < 6) {
     return res.status(400).json({ message: "Password must be at least 6 characters" });
   }
 
-  try {
-    const user = await User.findOne({
-      resetPasswordToken: hashToken(token),
-      resetPasswordExpires: { $gt: new Date() },
-    });
+  const invalidMessage = "Code is invalid or has expired";
 
-    if (!user) {
-      return res.status(400).json({ message: "Reset link is invalid or has expired" });
+  try {
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+
+    if (!user || !user.resetPasswordCode || user.resetPasswordExpires < new Date()) {
+      return res.status(400).json({ message: invalidMessage });
+    }
+
+    if (user.resetPasswordAttempts >= MAX_RESET_ATTEMPTS) {
+      clearResetCode(user);
+      await user.save();
+      return res.status(400).json({ message: "Too many attempts. Please request a new code" });
+    }
+
+    if (hashCode(String(code).trim()) !== user.resetPasswordCode) {
+      user.resetPasswordAttempts += 1;
+      await user.save();
+      return res.status(400).json({ message: invalidMessage });
     }
 
     user.password = await bcrypt.hash(password, 10);
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpires = undefined;
+    clearResetCode(user);
     await user.save();
 
     res.json({ message: "Password has been reset" });

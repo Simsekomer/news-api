@@ -1,20 +1,24 @@
-const nodemailer = require("nodemailer");
-
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.MAIL_USER,
-    pass: process.env.MAIL_PASS,
-  },
-});
+const BREVO_URL = "https://api.brevo.com/v3/smtp/email";
 
 async function sendMail(to, subject, html) {
-  await transporter.sendMail({
-    from: `"Maritime News" <${process.env.MAIL_USER}>`,
-    to,
-    subject,
-    html,
+  const response = await fetch(BREVO_URL, {
+    method: "POST",
+    headers: {
+      "api-key": process.env.BREVO_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sender: { name: "Maritime News", email: process.env.MAIL_USER },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
   });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Email could not be sent: ${error}`);
+  }
 }
 
 module.exports = sendMail;
